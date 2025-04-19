@@ -52,8 +52,12 @@ class ManyChatMessage(BaseModel):
     type: Literal["text"]
     text: str
 
-class ManyChatResponse(BaseModel):
+class ManyChatContent(BaseModel):
     messages: List[ManyChatMessage]
+
+class ManyChatResponse(BaseModel):
+    version: Literal["v2"]
+    content: ManyChatContent
 
 # -------------------------------
 # 3. Helper Functions
@@ -128,14 +132,15 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
         reply = "Sorry, I ran into an issue. Could you try again in a moment?"
 
     return {
-    "subscriber_id": payload.subscriberID,
-    "messages": [
-        {
-            "type": "text",
-            "text": reply
+        "version": "v2",
+        "content": {
+            "messages": [
+                {
+                    "type": "text",
+                    "text": reply
+                }
+            ]
         }
-    ]
-}
-
+    }
 
 # End of kila_sm.py
