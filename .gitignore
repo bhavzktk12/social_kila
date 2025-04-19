@@ -1,0 +1,19 @@
+# Prevent sensitive or unnecessary files from being pushed
+
+# Environment Variables
+.env
+
+# Compiled Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VS Code metadata
+.vscode/
+
+# macOS files
+.DS_Store
+
+# Render build artifacts (just in case)
+build/
+dist/
