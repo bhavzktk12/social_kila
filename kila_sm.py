@@ -46,6 +46,7 @@ class DMRequest(BaseModel):
     followCt: str = Field(...)
     lastInteract: str = Field(...)
     mutualFollow: str = Field(...)
+    subscriberID: str = Field(...)
 
 class ManyChatMessage(BaseModel):
     type: Literal["text"]
@@ -124,6 +125,15 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
         print("[OpenAI Error]", str(e))
         reply = "Sorry, I ran into an issue. Could you try again in a moment?"
 
-    return {"messages": [{"type": "text", "text": reply}]}
+    return {
+    "subscriber_id": payload.subscriberID,
+    "messages": [
+        {
+            "type": "text",
+            "text": reply
+        }
+    ]
+}
+
 
 # End of kila_sm.py
