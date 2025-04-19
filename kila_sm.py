@@ -92,6 +92,8 @@ def should_suggest_follow(is_follower: str, text: str) -> bool:
 
 @app.post("/dm", response_model=ManyChatResponse)
 async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
+    print("[DEBUG] Payload received:", payload.model_dump())
+
     name = payload.name.strip() if payload.name else "Unknown"
 
     meta = (
