@@ -131,7 +131,7 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
         print("[OpenAI Error]", str(e))
         reply = "Sorry, I ran into an issue. Could you try again in a moment?"
 
-        return {
+    return {
         "version": "v2",
         "content": {
             "type": "instagram",
