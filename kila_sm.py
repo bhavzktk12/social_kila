@@ -134,17 +134,15 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
     return {
     "version": "v2",
     "content": {
-        "type": "instagram",
         "messages": [
             {
                 "type": "text",
                 "text": reply
             }
-        ],
-        "actions": [],
-        "quick_replies": []
+        ]
     }
 }
+
 
 
 
