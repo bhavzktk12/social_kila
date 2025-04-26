@@ -131,18 +131,21 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
         print("[OpenAI Error]", str(e))
         reply = "Sorry, I ran into an issue. Could you try again in a moment?"
 
-    return {
-    "version": "v2",
-    "content": {
-        "type": "instagram",
-        "messages": [
-            {
-                "type": "text",
-                "text": reply
-            }
-        ]
+        return {
+        "version": "v2",
+        "content": {
+            "type": "instagram",
+            "messages": [
+                {
+                    "type": "text",
+                    "text": reply
+                }
+            ],
+            "actions": [],
+            "quick_replies": []
+        }
     }
-}
+
 
 
 # End of kila_sm.py
