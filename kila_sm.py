@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import List, Dict, Any, Literal
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from langchain_openai import OpenAIEmbeddings
