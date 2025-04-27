@@ -140,6 +140,6 @@ async def handle_dm(payload: DMRequest):
 
     safe_response = jsonable_encoder(response_data)
 
-    return JSONResponse(content=safe_response, media_type="application/json")
+    return safe_response
 
 # End of kila_sm.py
