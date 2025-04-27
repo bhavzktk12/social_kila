@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Literal
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
@@ -48,17 +49,6 @@ class DMRequest(BaseModel):
     mutualFollow: str = Field(...)
     subscriberID: str = Field(...)
 
-class ManyChatMessage(BaseModel):
-    type: Literal["text"]
-    text: str
-
-class ManyChatContent(BaseModel):
-    messages: List[ManyChatMessage]
-
-class ManyChatResponse(BaseModel):
-    version: Literal["v2"]
-    content: ManyChatContent
-
 # -------------------------------
 # 3. Helper Functions
 # -------------------------------
@@ -94,8 +84,8 @@ def should_suggest_follow(is_follower: str, text: str) -> bool:
 # 4. Endpoint: /dm
 # -------------------------------
 
-@app.post("/dm", response_model=ManyChatResponse)
-async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
+@app.post("/dm")
+async def handle_dm(payload: DMRequest):
     print("[DEBUG] Payload received:", payload.model_dump())
 
     name = payload.name.strip() if payload.name else "Unknown"
@@ -129,21 +119,24 @@ async def handle_dm(payload: DMRequest) -> Dict[str, Any]:
         reply = response.choices[0].message.content.strip()
     except Exception as e:
         print("[OpenAI Error]", str(e))
-        reply = "Sorry, I ran into an issue. Could you try again in a moment?"
+        reply = "Sorry, I ran into an issue. Could you try again in a moment."
 
-    return {
-    "version": "v2",
-    "content": {
-        "messages": [
-            {
-                "type": "text",
-                "text": reply
-            }
-        ]
+    response_data = {
+        "version": "v2",
+        "content": {
+            "type": "instagram",
+            "messages": [
+                {
+                    "type": "text",
+                    "text": reply,
+                    "buttons": []
+                }
+            ],
+            "actions": [],
+            "quick_replies": []
+        }
     }
-}
 
-
-
+    return JSONResponse(content=response_data, media_type="application/json", indent=2)
 
 # End of kila_sm.py
