@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Literal
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
@@ -137,6 +138,8 @@ async def handle_dm(payload: DMRequest):
         }
     }
 
-    return JSONResponse(content=response_data, media_type="application/json", indent=2)
+    safe_response = jsonable_encoder(response_data)
+
+    return JSONResponse(content=safe_response, media_type="application/json", indent=2)
 
 # End of kila_sm.py
