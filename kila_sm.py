@@ -121,10 +121,11 @@ async def handle_dm(payload: DMRequest):
         print("[OpenAI Error]", str(e))
         reply = "Sorry, I ran into an issue. Could you try again in a moment."
 
+    # Modified response structure to ensure the "type": "instagram" field is present
     response_data = {
         "version": "v2",
         "content": {
-            "type": "instagram",
+            "type": "instagram",  # This is the critical field that must be included
             "messages": [
                 {
                     "type": "text",
@@ -137,8 +138,13 @@ async def handle_dm(payload: DMRequest):
         }
     }
 
+    # Add a debug log to see what's actually being returned
+    print("[DEBUG] Response data before encoding:", response_data)
+    
+    # Use jsonable_encoder to ensure proper JSON serialization
     safe_response = jsonable_encoder(response_data)
-
+    print("[DEBUG] Response after encoding:", safe_response)
+    
     return safe_response
 
 # End of kila_sm.py
