@@ -16,6 +16,10 @@ from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
 from pinecone import Pinecone, PineconeApiException
 
+# Import calendar functionality
+from cal_api import router as calendar_router
+from cal_help import detect_calendar_intent, process_calendar_intent
+
 # ========================
 # CONFIGURATION
 # ========================
@@ -117,6 +121,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include calendar router
+app.include_router(calendar_router)
 
 # ========================
 # LOCAL CONVERSATION CACHE
@@ -262,6 +269,39 @@ def should_suggest_follow(is_follower: str, text: str) -> bool:
     return (is_follower == "0") and any(kw in text.lower() for kw in keywords)
 
 # ========================
+# CALENDAR UTILS
+# ========================
+
+def format_calendar_events(events: List[dict], max_events: int = 5) -> str:
+    """Format calendar events for display in messages."""
+    if not events:
+        return "You don't have any upcoming events."
+    
+    formatted = "Your upcoming events:\n"
+    for i, event in enumerate(events[:max_events], 1):
+        start_time = event['start'].split('T')[1].split('+')[0][:5]  # Extract HH:MM
+        date = event['start'].split('T')[0]  # Extract YYYY-MM-DD
+        formatted += f"{i}. {event['summary']} on {date} at {start_time}\n"
+    
+    if len(events) > max_events:
+        formatted += f"...and {len(events) - max_events} more.\n"
+    
+    return formatted
+
+def format_availability_slots(slots: List[dict], date: str) -> str:
+    """Format availability slots for display in messages."""
+    if not slots:
+        return f"No available slots found for {date}."
+    
+    formatted = f"Available slots for {date}:\n"
+    for i, slot in enumerate(slots, 1):
+        start = slot['start'].split('T')[1].split('+')[0][:5]  # Extract HH:MM
+        end = slot['end'].split('T')[1].split('+')[0][:5]      # Extract HH:MM
+        formatted += f"{i}. {start} - {end}\n"
+    
+    return formatted
+
+# ========================
 # API ENDPOINTS
 # ========================
 
@@ -337,6 +377,34 @@ async def clear_memory(username: str):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/test-calendar")
+async def test_calendar():
+    """Test the calendar integration."""
+    results = {}
+    
+    # Test connection to Google Calendar
+    try:
+        from cal_api import get_calendar_service
+        service = get_calendar_service()
+        calendar = service.calendars().get(calendarId="ceo@agently-ai.com").execute()
+        results["connection"] = "success"
+        results["calendar_name"] = calendar.get('summary', 'Unknown')
+    except Exception as e:
+        results["connection"] = "error"
+        results["error"] = str(e)
+    
+    # Test listing events
+    try:
+        from cal_api import list_events
+        response = await list_events(max_results=5)
+        results["list_events"] = "success" if response.success else "error"
+        results["events_count"] = len(response.data.get("events", [])) if response.success else 0
+    except Exception as e:
+        results["list_events"] = "error"
+        results["list_events_error"] = str(e)
+    
+    return results
+
 @app.post("/dm")
 async def handle_dm(payload: DMRequest):
     """
@@ -350,6 +418,15 @@ async def handle_dm(payload: DMRequest):
     # Use message_content if provided, otherwise use message
     message = payload.message_content if payload.message_content else payload.message
     print(f"[REQUEST] Message: '{message}'")
+    
+    # Check for calendar intent
+    calendar_intent = detect_calendar_intent(message)
+    calendar_data = None
+    if calendar_intent:
+        print(f"[CALENDAR] Detected calendar intent: {calendar_intent}")
+        instruction, extracted_data = process_calendar_intent(calendar_intent, message)
+        print(f"[CALENDAR] Calendar instruction: {instruction}")
+        print(f"[CALENDAR] Extracted data: {extracted_data}")
     
     # Extract user info
     name = payload.name.strip() if payload.name else "Unknown"
@@ -379,6 +456,42 @@ async def handle_dm(payload: DMRequest):
         # We have existing memory
         current_memory = memory_str
     
+    # Handle calendar actions if needed
+    if calendar_intent:
+        try:
+            if calendar_intent == "check_availability":
+                # Check if we have a date
+                if "dates" in extracted_data and extracted_data["dates"]:
+                    date_str = extracted_data["dates"][0]
+                    try:
+                        # Call the calendar API directly
+                        from cal_api import check_availability
+                        calendar_response = await check_availability(date=date_str)
+                        
+                        if calendar_response.success:
+                            available_slots = calendar_response.data.get('available_slots', [])
+                            friendly_date = calendar_response.data.get('date', date_str)
+                            calendar_data = format_availability_slots(available_slots, friendly_date)
+                            print(f"[CALENDAR] Retrieved availability: {calendar_data}")
+                    except Exception as e:
+                        print(f"[ERROR] Calendar availability error: {str(e)}")
+            
+            elif calendar_intent == "list_appointments":
+                try:
+                    # Call the calendar API directly
+                    from cal_api import list_events
+                    calendar_response = await list_events(max_results=5)
+                    
+                    if calendar_response.success:
+                        events = calendar_response.data.get("events", [])
+                        calendar_data = format_calendar_events(events)
+                        print(f"[CALENDAR] Retrieved events: {calendar_data}")
+                except Exception as e:
+                    print(f"[ERROR] Calendar list events error: {str(e)}")
+        
+        except Exception as e:
+            print(f"[ERROR] Calendar processing error: {str(e)}")
+    
     # Build conversation context for the AI
     chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
@@ -394,6 +507,19 @@ async def handle_dm(payload: DMRequest):
     if should_suggest_follow(payload.isFollower, message):
         follow_prompt = "[NOTE FOR KILA] The user is not following us but is showing interest. If natural, let them know that following helps you remember them better next time."
         chat_messages.append({"role": "system", "content": follow_prompt})
+    
+    # Add calendar context if applicable
+    if calendar_intent:
+        chat_messages.append({
+            "role": "system", 
+            "content": f"The user has a calendar-related request. Instructions: {instruction}"
+        })
+        
+        if calendar_data:
+            chat_messages.append({
+                "role": "system", 
+                "content": f"CALENDAR API RESULT: {calendar_data}"
+            })
     
     # Add the current user message
     chat_messages.append({"role": "user", "content": message})
@@ -451,7 +577,10 @@ async def handle_dm(payload: DMRequest):
     print(f"[RESPONSE] Sending response data: {json.dumps(response_data)[:100]}...")
     return response_data
 
-# Error handlers
+# ========================
+# ERROR HANDLERS
+# ========================
+
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     """Handle any unhandled exceptions."""
@@ -460,6 +589,17 @@ async def generic_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"message": "An internal server error occurred", "detail": str(exc)}
     )
+
+@app.exception_handler(Exception)
+async def calendar_exception_handler(request: Request, exc: Exception):
+    """Handle calendar-related exceptions."""
+    if "calendar" in str(request.url).lower():
+        print(f"[ERROR] Calendar API error: {str(exc)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"message": "An error occurred with the calendar service", "detail": str(exc)}
+        )
+    raise exc
 
 # ========================
 # MAIN EXECUTION
