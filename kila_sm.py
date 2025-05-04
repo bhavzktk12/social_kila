@@ -91,12 +91,13 @@ class DMRequest(BaseModel):
     name: str = Field(..., description="User's full name")
     username: str = Field(..., description="Instagram username")
     message: str = Field(..., description="Current message from user")
-    previous_message: Optional[str] = Field(None, description="Previous message from user")
     isFollower: str = Field(..., description="Whether user follows the account (1=yes, 0=no)")
     followCt: str = Field(..., description="User's follower count")
     lastInteract: str = Field(..., description="Timestamp of last interaction")
     mutualFollow: str = Field(..., description="Whether there's a mutual follow (1=yes, 0=no)")
     subscriberID: str = Field(..., description="Unique subscriber ID")
+    # Can accept message_content too as an alternative to message
+    message_content: Optional[str] = Field(None, description="Alternative field for message content")
 
 class MessageResponse(BaseModel):
     version: str = "v2"
@@ -118,6 +119,14 @@ app.add_middleware(
 )
 
 # ========================
+# LOCAL CONVERSATION CACHE
+# ========================
+
+# Simple in-memory cache as backup for Pinecone
+# Maps username -> conversation history
+conversation_cache = {}
+
+# ========================
 # MEMORY FUNCTIONS
 # ========================
 
@@ -132,6 +141,12 @@ def fetch_memory(username: str) -> str:
         String containing conversation summary or empty string if no memory found
     """
     start_time = time.time()
+    
+    # First check our local cache
+    if username in conversation_cache:
+        print(f"[MEMORY] Found conversation in local cache for {username}")
+        return conversation_cache[username]
+    
     try:
         print(f"[MEMORY] Fetching memory for user: {username}")
         resp = pinecone_index.fetch(ids=[username], namespace="kila_sm")
@@ -140,11 +155,15 @@ def fetch_memory(username: str) -> str:
         print(f"[MEMORY] Raw Pinecone response: {resp}")
         
         # Check if the response has vectors attribute and contains our username
-        vectors = resp.get('vectors', {})
+        vectors = getattr(resp, 'vectors', {})
         if username in vectors:
-            metadata = vectors[username].get('metadata', {})
+            metadata = getattr(vectors[username], 'metadata', {})
             summary = metadata.get('summary', '')
             print(f"[MEMORY] Successfully retrieved memory for {username} ({len(summary)} chars)")
+            
+            # Store in local cache
+            conversation_cache[username] = summary
+            
             duration = time.time() - start_time
             print(f"[MEMORY] Memory fetch took {duration:.2f} seconds")
             return summary
@@ -170,6 +189,10 @@ def store_memory(username: str, summary: str, message: str, last_interaction: st
         is_follower: Whether user follows the account
     """
     start_time = time.time()
+    
+    # First update our local cache
+    conversation_cache[username] = summary
+    
     try:
         print(f"[MEMORY] Storing memory for user: {username}")
         
@@ -214,6 +237,25 @@ def store_memory(username: str, summary: str, message: str, last_interaction: st
         print(f"[ERROR] Error in store_memory: {str(e)}")
         # Don't re-raise the exception here - log it but let the flow continue
 
+def is_first_time_user(username: str, memory_str: str) -> bool:
+    """
+    Determine if this is the first conversation with this user.
+    
+    Args:
+        username: Username to check
+        memory_str: Memory string from Pinecone
+        
+    Returns:
+        True if this appears to be the first conversation, False otherwise
+    """
+    # Check if we have any memory for this user
+    if not memory_str:
+        return True
+    
+    # Check if there's any conversation history in the memory string
+    conversation_markers = ["User:", "KILA:", "conversation:", "said:"]
+    return not any(marker in memory_str for marker in conversation_markers)
+
 def should_suggest_follow(is_follower: str, text: str) -> bool:
     """Determine if we should suggest following the account."""
     keywords = ["book", "price", "help", "demo", "automate", "setup"]
@@ -244,6 +286,8 @@ async def test_memory(username: str):
         results["memory_exists"] = bool(memory)
         if memory:
             results["memory_content"] = memory
+        else:
+            results["memory_content"] = None
     except Exception as e:
         results["fetch_status"] = "error"
         results["fetch_error"] = str(e)
@@ -251,9 +295,11 @@ async def test_memory(username: str):
     # Try to store test memory
     try:
         test_text = f"Test memory for {username} at {datetime.now()}"
+        test_memory = f"Name: Test User, Handle: {username}\nUser: Hello\nKILA: Hi there! How can I help you today?\nUser: {test_text}"
+        
         store_memory(
             username=username,
-            summary=f"Test user metadata. Name: Test User",
+            summary=test_memory,
             message=test_text,
             last_interaction=datetime.now().isoformat(),
             is_follower=True
@@ -276,6 +322,21 @@ async def test_memory(username: str):
     
     return results
 
+@app.get("/clear-memory/{username}")
+async def clear_memory(username: str):
+    """Clear the memory for a specific user."""
+    try:
+        # Clear from local cache
+        if username in conversation_cache:
+            del conversation_cache[username]
+        
+        # Delete from Pinecone
+        pinecone_index.delete(ids=[username], namespace="kila_sm")
+        
+        return {"status": "success", "message": f"Memory cleared for {username}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/dm")
 async def handle_dm(payload: DMRequest):
     """
@@ -285,8 +346,10 @@ async def handle_dm(payload: DMRequest):
     """
     request_time = datetime.now().isoformat()
     print(f"[REQUEST] Received at {request_time} from user: {payload.username}")
-    print(f"[REQUEST] Message: '{payload.message}'")
-    print(f"[REQUEST] Full payload: {payload.model_dump_json()}")
+    
+    # Use message_content if provided, otherwise use message
+    message = payload.message_content if payload.message_content else payload.message
+    print(f"[REQUEST] Message: '{message}'")
     
     # Extract user info
     name = payload.name.strip() if payload.name else "Unknown"
@@ -301,36 +364,39 @@ async def handle_dm(payload: DMRequest):
     
     # Fetch existing memory or create new one
     memory_str = fetch_memory(payload.username)
+    print(f"[MEMORY] Retrieved memory: {memory_str[:100]}...")
+    
+    # Check if this is a first-time user
+    first_time = is_first_time_user(payload.username, memory_str)
+    print(f"[FLOW] Is first time user: {first_time}")
+    
+    # Initialize or update conversation history
     if not memory_str:
+        # First time ever - just store user metadata
+        current_memory = meta
         print(f"[FLOW] No existing memory found for {payload.username}. Creating new memory entry.")
-        store_memory(
-            payload.username, 
-            meta, 
-            payload.message, 
-            payload.lastInteract,
-            is_follower
-        )
     else:
-        print(f"[FLOW] Found existing memory for {payload.username} ({len(memory_str)} chars)")
+        # We have existing memory
+        current_memory = memory_str
     
     # Build conversation context for the AI
     chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
     # Add memory context if available
-    if memory_str:
-        chat_messages.append({"role": "system", "content": f"User context: {memory_str}"})
+    if current_memory:
+        # If this is not the first time user, explicitly tell KILA this is a returning user
+        if not first_time:
+            chat_messages.append({"role": "system", "content": f"IMPORTANT: This is a returning user that you've talked to before. DO NOT introduce yourself as if this is your first conversation. User context: {current_memory}"})
+        else:
+            chat_messages.append({"role": "system", "content": f"User context: {current_memory}"})
     
     # Suggest following if appropriate
-    if should_suggest_follow(payload.isFollower, payload.message):
+    if should_suggest_follow(payload.isFollower, message):
         follow_prompt = "[NOTE FOR KILA] The user is not following us but is showing interest. If natural, let them know that following helps you remember them better next time."
         chat_messages.append({"role": "system", "content": follow_prompt})
     
-    # Add previous message context if provided
-    if payload.previous_message:
-        chat_messages.append({"role": "system", "content": f"User's previous message: {payload.previous_message}"})
-    
     # Add the current user message
-    chat_messages.append({"role": "user", "content": payload.message})
+    chat_messages.append({"role": "user", "content": message})
     
     # Generate response from OpenAI
     try:
@@ -349,14 +415,19 @@ async def handle_dm(payload: DMRequest):
     
     # Update memory with this interaction
     try:
-        # Add this interaction to the memory summary
-        updated_summary = f"{memory_str or meta}\nUser: {payload.message}\nKILA: {reply}"
+        # Add this interaction to the conversation history
+        if first_time:
+            # For first time users, start a new conversation
+            updated_memory = f"{meta}\nconversation_started: {request_time}\nUser: {message}\nKILA: {reply}"
+        else:
+            # For returning users, add to existing conversation
+            updated_memory = f"{current_memory}\nUser: {message}\nKILA: {reply}"
         
         # Store updated memory
         store_memory(
             payload.username,
-            updated_summary,
-            payload.message,
+            updated_memory,
+            message,
             request_time,  # Use current timestamp
             is_follower
         )
