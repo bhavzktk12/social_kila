@@ -4,6 +4,7 @@
 
 import os
 import json
+import tempfile
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Union
@@ -624,7 +625,7 @@ async def handle_dm(payload: DMRequest):
             if calendar_intent == "check_availability":
                 # Check if we have a date
                 if "dates" in extracted_data and extracted_data["dates"]:
-                    date_str = extracted_data["dates"][0]
+                    date_str = extracted_data["dates"][- 1]
                     try:
                         # Call the calendar API directly
                         from cal_api import check_availability
@@ -642,78 +643,157 @@ async def handle_dm(payload: DMRequest):
             elif calendar_intent == "book_appointment":
                 print(f"[CALENDAR] Processing booking intent")
                 try:
-                    # Check if we have date information
-                    if "dates" in extracted_data and extracted_data["dates"]:
-                        from cal_api import create_event, EventRequest
-                        from dateparser import parse
-                        
-                        # Parse the date
-                        date_str = extracted_data["dates"][0]
-                        print(f"[CALENDAR] Date from extracted data: {date_str}")
-                        
-                        # Parse start and end times
-                        start_time = parse(date_str, settings={'PREFER_DATES_FROM': 'future'})
-                        
-                        if not start_time:
-                            print(f"[CALENDAR] Failed to parse date: {date_str}")
-                        else:
-                            print(f"[CALENDAR] Parsed start time: {start_time.isoformat()}")
+                    # First, check if we have an email for this booking
+                    has_email = "email" in extracted_data and extracted_data["email"] and len(str(extracted_data["email"]).strip()) > 0
+                    
+                    if not has_email:
+                        # Add a system message to instruct KILA to ask for email or alternative contact
+                        chat_messages.append({
+                            "role": "system", 
+                            "content": "IMPORTANT: The user wants to book a call but hasn't provided an email address. " +
+                                      "Ask them for their email to send a calendar invitation. " +
+                                      "Also mention they can provide a phone number or use their Instagram handle if they prefer."
+                        })
+                        # Set calendar data to indicate we need contact info
+                        calendar_data = "Need to collect contact information first"
+                    else:
+                        # Check if we have date information
+                        if "dates" in extracted_data and extracted_data["dates"]:
+                            from cal_api import check_availability, create_event, EventRequest
+                            from dateparser import parse
                             
-                            # Set end time (1 hour later)
-                            end_time = start_time + timedelta(hours=1)
+                            # Parse the date
+                            date_str = extracted_data["dates"][-1]
+                            print(f"[CALENDAR] Date from extracted data: {date_str}")
                             
-                            # Create summary and description
-                            summary = f"Meeting with {payload.username}"
-                            if "purpose" in extracted_data:
-                                summary += f" - {extracted_data['purpose']}"
+                            # Parse start and end times
+                            start_time = parse(date_str, settings={'PREFER_DATES_FROM': 'future'})
                             
-                            description = f"Meeting requested by {payload.username} via Instagram DM"
-                            
-                            # Get attendee email from extracted data if available
-                            attendees = []
-                            if "email" in extracted_data and extracted_data["email"]:
-                                attendees.append(extracted_data["email"])
-                                print(f"[CALENDAR] Using attendee email from message: {extracted_data['email']}")
-                            
-                            # Create event request
-                            event_data = EventRequest(
-                                summary=summary,
-                                start_time=start_time.isoformat(),
-                                end_time=end_time.isoformat(),
-                                description=description,
-                                attendees=attendees  # Use extracted email or empty list
-                            )
-                            
-                            # Create the event
-                            print(f"[CALENDAR] Creating event with data: {event_data}")
-                            result = await create_event(event_data)
-                            
-                            # Check result
-                            if result.success:
-                                print(f"[CALENDAR] Successfully created event: {result.data}")
-                                event_id = result.data.get("event", {}).get("id")
-                                calendar_data = f"Appointment successfully booked for {start_time.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
-                                
-                                # Add note about attendee if no email was provided
-                                if not attendees:
-                                    calendar_data += " Please ask the user for their email to send a calendar invitation."
-                                    chat_messages.append({
-                                        "role": "system", 
-                                        "content": "IMPORTANT: The user didn't provide an email address. Please ask for their email so you can send them a calendar invitation with the meeting details."
-                                    })
+                            if not start_time:
+                                print(f"[CALENDAR] Failed to parse date: {date_str}")
+                                calendar_data = f"Failed to understand the requested date/time: {date_str}. Please ask for a more specific date and time."
+                                chat_messages.append({
+                                    "role": "system",
+                                    "content": f"CALENDAR ERROR: {calendar_data} Ask the user to specify the date and time more clearly, for example 'Monday May 12th at 2pm'."
+                                })
                             else:
-                                print(f"[CALENDAR] Failed to create event: {result.message}")
-                                calendar_data = f"Error creating event: {result.message}"
-                            
-                            # Add calendar data to AI context
+                                print(f"[CALENDAR] Parsed start time: {start_time.isoformat()}")
+                                
+                                # Set end time (1 hour later)
+                                end_time = start_time + timedelta(hours=1)
+                                
+                                # First check if this time slot is available
+                                try:
+                                    calendar_response = await check_availability(date=start_time.isoformat())
+                                    
+                                    if calendar_response.success:
+                                        # Extract available slots
+                                        available_slots = calendar_response.data.get('available_slots', [])
+                                        
+                                        # Check if the requested time is in an available slot
+                                        requested_time_available = False
+                                        alternative_slots = []
+                                        
+                                        for slot in available_slots:
+                                            slot_start = datetime.fromisoformat(slot['start'].replace('Z', '+00:00'))
+                                            slot_end = datetime.fromisoformat(slot['end'].replace('Z', '+00:00'))
+                                            
+                                            # If requested time is within this slot
+                                            if (start_time >= slot_start and end_time <= slot_end):
+                                                requested_time_available = True
+                                                break
+                                            else:
+                                                # Add to alternatives list
+                                                alternative_slots.append((slot_start, slot_end))
+                                        
+                                        if not requested_time_available and alternative_slots:
+                                            # Suggested alternatives
+                                            alternatives_text = "The requested time is not available. Here are some alternatives:\n"
+                                            for i, (alt_start, alt_end) in enumerate(alternative_slots[:3], 1):
+                                                alternatives_text += f"{i}. {alt_start.strftime('%A, %B %d at %I:%M %p')} - {alt_end.strftime('%I:%M %p')}\n"
+                                            
+                                            calendar_data = alternatives_text
+                                            chat_messages.append({
+                                                "role": "system",
+                                                "content": f"CALENDAR CONFLICT: {calendar_data} Please suggest one of these alternative times to the user."
+                                            })
+                                        else:
+                                            # Create summary and description
+                                            summary = f"Meeting with {payload.username}"
+                                            if "purpose" in extracted_data:
+                                                summary += f" - {extracted_data['purpose']}"
+                                            
+                                            description = f"Meeting requested by {payload.username} via Instagram DM"
+                                            
+                                            # Get attendee email from extracted data
+                                            attendees = []
+                                            if extracted_data["email"]:
+                                                attendees.append(extracted_data["email"])
+                                                print(f"[CALENDAR] Using attendee email from message: {extracted_data['email']}")
+                                            
+                                            # Create event request
+                                            event_data = EventRequest(
+                                                summary=summary,
+                                                start_time=start_time.isoformat(),
+                                                end_time=end_time.isoformat(),
+                                                description=description,
+                                                attendees=attendees
+                                            )
+                                            
+                                            # Create the event
+                                            print(f"[CALENDAR] Creating event with data: {event_data}")
+                                            result = await create_event(event_data)
+                                            
+                                            # Check result - IMPROVED ERROR HANDLING HERE
+                                            if result and result.success:
+                                                print(f"[CALENDAR] Successfully created event: {result.data}")
+                                                event_id = result.data.get("event", {}).get("id")
+                                                calendar_data = f"BOOKING CONFIRMED: Appointment successfully booked for {start_time.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
+                                            else:
+                                                error_msg = result.message if result else "Unknown error occurred"
+                                                print(f"[CALENDAR] Failed to create event: {error_msg}")
+                                                calendar_data = f"BOOKING FAILED: I couldn't schedule your appointment due to a technical issue ({error_msg}). Please tell the user something casual like 'I'm having some trouble with my calendar right now, but I've noted your request for {start_time.strftime('%A, %B %d at %I:%M %p')}. I'll make sure Mr. Kotak gets the details and reaches out to confirm soon.' Make sure to confirm you have their contact information."
+                                            
+                                            # Add clear instruction for KILA in system message
+                                            chat_messages.append({
+                                                "role": "system",
+                                                "content": f"CALENDAR ACTION RESULT: {calendar_data}"
+                                            })
+                                            
+                                            # If the booking failed, add explicit instruction to collect contact info
+                                            if not (result and result.success):
+                                                chat_messages.append({
+                                                    "role": "system",
+                                                    "content": "IMPORTANT: Since the booking failed, make sure you have contact information from the user (email preferred, but also ask for phone or confirm their Instagram handle). Don't mention the technical error details - just be casual and reassure them that we'll follow up."
+                                                })
+                                    else:
+                                        print(f"[CALENDAR] Error checking availability: {calendar_response.message}")
+                                        calendar_data = f"Error checking availability: {calendar_response.message}"
+                                        chat_messages.append({
+                                            "role": "system",
+                                            "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar system, but you'll note their request for {start_time.strftime('%A, %B %d')} and make sure someone follows up. Ask for their email or preferred contact method."
+                                        })
+                                except Exception as e:
+                                    print(f"[CALENDAR] Error checking availability: {str(e)}")
+                                    calendar_data = f"Error checking availability: {str(e)}"
+                                    chat_messages.append({
+                                        "role": "system",
+                                        "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar system, but you'll note their request for {start_time.strftime('%A, %B %d')} and make sure someone follows up. Ask for their email or preferred contact method."
+                                    })
+                        else:
+                            print("[CALENDAR] No date information found in extracted data")
+                            calendar_data = "No date information found in the message"
                             chat_messages.append({
                                 "role": "system",
-                                "content": f"CALENDAR ACTION RESULT: {calendar_data}"
+                                "content": f"CALENDAR ERROR: {calendar_data} Ask the user to specify a date and time for the appointment."
                             })
-                    else:
-                        print("[CALENDAR] No date information found in extracted data")
                 except Exception as e:
                     print(f"[CALENDAR] Error in calendar event creation: {str(e)}")
+                    calendar_data = f"Error in calendar event creation: {str(e)}"
+                    chat_messages.append({
+                        "role": "system",
+                        "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar, but you'll note their request and make sure someone follows up. Ask for their email or preferred contact method if you don't already have it."
+                    })
             
             elif calendar_intent == "list_appointments":
                 try:
@@ -732,58 +812,139 @@ async def handle_dm(payload: DMRequest):
             elif "reschedule" in message.lower() or "change" in message.lower():
                 print(f"[CALENDAR] Processing reschedule request")
                 try:
-                    # Extract the new date
-                    from cal_help import extract_dates
-                    dates = extract_dates(message)
+                    # First, check if we have an email for this booking
+                    has_email = "email" in extracted_data and extracted_data["email"]
                     
-                    if dates:
-                        from cal_api import create_event, EventRequest
+                    if not has_email:
+                        # Add a system message to instruct KILA to ask for email or alternative contact
+                        chat_messages.append({
+                            "role": "system", 
+                            "content": "IMPORTANT: The user wants to reschedule but hasn't provided an email address. " +
+                                      "Ask them for their email to send a calendar invitation. " +
+                                      "Also mention they can provide a phone number or use their Instagram handle if they prefer."
+                        })
+                        # Set calendar data to indicate we need contact info
+                        calendar_data = "Need to collect contact information first"
+                    else:
+                        # Extract the new date
+                        from cal_help import extract_dates
+                        dates = extract_dates(message)
                         
-                        # Use the first date found
-                        new_date = dates[0]
-                        print(f"[CALENDAR] New date for rescheduling: {new_date.isoformat()}")
-                        
-                        # Set end time (1 hour later)
-                        end_time = new_date + timedelta(hours=1)
-                        
-                        # Get attendee email from extracted data if available
-                        attendees = []
-                        if "email" in extracted_data and extracted_data["email"]:
-                            attendees.append(extracted_data["email"])
-                        
-                        # Create event
-                        event_data = EventRequest(
-                            summary=f"Meeting with {payload.username} (Rescheduled)",
-                            start_time=new_date.isoformat(),
-                            end_time=end_time.isoformat(),
-                            description=f"Rescheduled meeting via Instagram DM",
-                            attendees=attendees
-                        )
-                        
-                        # Create the event
-                        print(f"[CALENDAR] Creating rescheduled event: {event_data}")
-                        result = await create_event(event_data)
-                        
-                        # Check result
-                        if result.success:
-                            print(f"[CALENDAR] Successfully created rescheduled event: {result.data}")
-                            event_id = result.data.get("event", {}).get("id")
-                            calendar_data = f"Appointment successfully rescheduled for {new_date.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
+                        if dates:
+                            from cal_api import check_availability, create_event, EventRequest
                             
-                            # Add note about attendee if no email was provided
-                            if not attendees:
-                                calendar_data += " Please ask the user for their email to send a calendar invitation."
+                            # Use the last date mentioned
+                            new_date = dates[-1] if dates else None
+                            print(f"[CALENDAR] New date for rescheduling: {new_date.isoformat()}")
+                            
+                            # Set end time (1 hour later)
+                            end_time = new_date + timedelta(hours=1)
+                            
+                            # Check if this time slot is available
+                            try:
+                                calendar_response = await check_availability(date=new_date.isoformat())
+                                
+                                if calendar_response.success:
+                                    # Extract available slots
+                                    available_slots = calendar_response.data.get('available_slots', [])
+                                    
+                                    # Check if the requested time is in an available slot
+                                    requested_time_available = False
+                                    alternative_slots = []
+                                    
+                                    for slot in available_slots:
+                                        slot_start = datetime.fromisoformat(slot['start'].replace('Z', '+00:00'))
+                                        slot_end = datetime.fromisoformat(slot['end'].replace('Z', '+00:00'))
+                                        
+                                        # If requested time is within this slot
+                                        if (new_date >= slot_start and end_time <= slot_end):
+                                            requested_time_available = True
+                                            break
+                                        else:
+                                            # Add to alternatives list
+                                            alternative_slots.append((slot_start, slot_end))
+                                    
+                                    if not requested_time_available and alternative_slots:
+                                        # Suggested alternatives
+                                        alternatives_text = "The requested time is not available for rescheduling. Here are some alternatives:\n"
+                                        for i, (alt_start, alt_end) in enumerate(alternative_slots[:3], 1):
+                                            alternatives_text += f"{i}. {alt_start.strftime('%A, %B %d at %I:%M %p')} - {alt_end.strftime('%I:%M %p')}\n"
+                                        
+                                        calendar_data = alternatives_text
+                                        chat_messages.append({
+                                            "role": "system",
+                                            "content": f"CALENDAR CONFLICT: {calendar_data} Please suggest one of these alternative times to the user for rescheduling."
+                                        })
+                                    else:
+                                        # Get attendee email from extracted data
+                                        attendees = []
+                                        if extracted_data["email"]:
+                                            attendees.append(extracted_data["email"])
+                                            print(f"[CALENDAR] Using attendee email from message: {extracted_data['email']}")
+                                        
+                                        # Create event
+                                        event_data = EventRequest(
+                                            summary=f"Meeting with {payload.username} (Rescheduled)",
+                                            start_time=new_date.isoformat(),
+                                            end_time=end_time.isoformat(),
+                                            description=f"Rescheduled meeting via Instagram DM",
+                                            attendees=attendees
+                                        )
+                                        
+                                        # Create the event
+                                        print(f"[CALENDAR] Creating rescheduled event: {event_data}")
+                                        result = await create_event(event_data)
+                                        
+                                        # Check result - IMPROVED ERROR HANDLING HERE
+                                        if result and result.success:
+                                            print(f"[CALENDAR] Successfully created rescheduled event: {result.data}")
+                                            event_id = result.data.get("event", {}).get("id")
+                                            calendar_data = f"RESCHEDULE CONFIRMED: Appointment successfully rescheduled for {new_date.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
+                                        else:
+                                            error_msg = result.message if result else "Unknown error occurred"
+                                            print(f"[CALENDAR] Failed to create rescheduled event: {error_msg}")
+                                            calendar_data = f"RESCHEDULE FAILED: I couldn't reschedule your appointment due to a technical issue ({error_msg}). Please tell the user something casual like 'I'm having some trouble with my calendar right now, but I've noted your request to reschedule for {new_date.strftime('%A, %B %d at %I:%M %p')}. I'll make sure Mr. Kotak gets the details and reaches out to confirm soon.'"
+                                        
+                                        # Add clear instruction for KILA in system message
+                                        chat_messages.append({
+                                            "role": "system",
+                                            "content": f"CALENDAR ACTION RESULT: {calendar_data}"
+                                        })
+                                        
+                                        # If the rescheduling failed, add explicit instruction to collect contact info
+                                        if not (result and result.success):
+                                            chat_messages.append({
+                                                "role": "system",
+                                                "content": "IMPORTANT: Since the rescheduling failed, make sure you have contact information from the user (email preferred, but also ask for phone or confirm their Instagram handle). Don't mention the technical error details - just be casual and reassure them that we'll follow up."
+                                            })
+                                else:
+                                    print(f"[CALENDAR] Error checking availability: {calendar_response.message}")
+                                    calendar_data = f"Error checking availability: {calendar_response.message}"
+                                    chat_messages.append({
+                                        "role": "system",
+                                        "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar system, but you'll note their request for {new_date.strftime('%A, %B %d')} and make sure someone follows up. Ask for their email or preferred contact method."
+                                    })
+                            except Exception as e:
+                                print(f"[CALENDAR] Error checking availability: {str(e)}")
+                                calendar_data = f"Error checking availability: {str(e)}"
                                 chat_messages.append({
-                                    "role": "system", 
-                                    "content": "IMPORTANT: The user didn't provide an email address. Please ask for their email so you can send them a calendar invitation with the meeting details."
+                                    "role": "system",
+                                    "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar system, but you'll note their reschedule request and make sure someone follows up. Ask for their email or preferred contact method."
                                 })
                         else:
-                            print(f"[CALENDAR] Failed to create rescheduled event: {result.message}")
-                            calendar_data = f"Error creating rescheduled event: {result.message}"
-                    else:
-                        print("[CALENDAR] Could not extract new date for rescheduling")
+                            print("[CALENDAR] Could not extract new date for rescheduling")
+                            calendar_data = "Could not understand the new date for rescheduling."
+                            chat_messages.append({
+                                "role": "system",
+                                "content": f"CALENDAR ERROR: {calendar_data} Ask the user to specify a clear date and time for rescheduling, for example 'Monday May 12th at 2pm'."
+                            })
                 except Exception as e:
                     print(f"[CALENDAR] Error in rescheduling: {str(e)}")
+                    calendar_data = f"Error in rescheduling: {str(e)}"
+                    chat_messages.append({
+                        "role": "system",
+                        "content": f"CALENDAR ERROR: {calendar_data} Tell the user you're having trouble with your calendar, but you'll note their rescheduling request and make sure someone follows up. Ask for their email or preferred contact method if you don't already have it."
+                    })
         
         except Exception as e:
             print(f"[ERROR] Calendar processing error: {str(e)}")
