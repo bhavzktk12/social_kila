@@ -8,11 +8,49 @@ import datetime
 import pytz
 import re
 import dateparser
+import os
+import json
+import tempfile
 
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
-SERVICE_ACCOUNT_FILE = "./kila-456404-d406b0474c4f.json"
+# Check for service account file
+possible_paths = [
+    "./kila-456404-d406b0474c4f.json",  # Original path
+    "/etc/secrets/kila-456404-d406b0474c4f.json",  # Render secrets path
+    os.path.join(os.getcwd(), "kila-456404-d406b0474c4f.json")  # Absolute path
+]
+
+# Find the first path that exists
+SERVICE_ACCOUNT_FILE = None
+for path in possible_paths:
+    if os.path.exists(path):
+        SERVICE_ACCOUNT_FILE = path
+        print(f"[CALENDAR] Found service account file at: {path}")
+        break
+
+# If file not found, try to create it from environment variable
+if not SERVICE_ACCOUNT_FILE:
+    print("[CALENDAR] Service account file not found, checking environment variable")
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    
+    if service_account_json:
+        # Create a temporary file with the JSON content
+        try:
+            fd, SERVICE_ACCOUNT_FILE = tempfile.mkstemp(suffix='.json')
+            with os.fdopen(fd, 'w') as f:
+                f.write(service_account_json)
+            print(f"[CALENDAR] Created service account file from environment variable at: {SERVICE_ACCOUNT_FILE}")
+        except Exception as e:
+            print(f"[CALENDAR] Error creating service account file: {str(e)}")
+            # Fall back to default path
+            SERVICE_ACCOUNT_FILE = "./kila-456404-d406b0474c4f.json"
+    else:
+        print("[CALENDAR] WARNING: No service account file or environment variable found!")
+        # Fall back to default path in case something else handles it
+        SERVICE_ACCOUNT_FILE = "./kila-456404-d406b0474c4f.json"
+
 CALENDAR_ID = "ceo@agently-ai.com"
 TIMEZONE = "America/Chicago"  # Adjust to your timezone
 
@@ -51,12 +89,16 @@ class CalendarResponse(BaseModel):
 # ------------------------------
 def get_calendar_service():
     """Get an authorized Google Calendar API service"""
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/calendar"],
-        subject="ceo@agently-ai.com"  # Added to impersonate the calendar owner
-    )
-    return build("calendar", "v3", credentials=credentials)
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=["https://www.googleapis.com/auth/calendar"],
+            subject="ceo@agently-ai.com"  # Added to impersonate the calendar owner
+        )
+        return build("calendar", "v3", credentials=credentials)
+    except Exception as e:
+        print(f"[CALENDAR] Error getting calendar service: {str(e)}")
+        raise
 
 # ------------------------------
 # ROUTER
