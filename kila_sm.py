@@ -644,7 +644,7 @@ async def handle_dm(payload: DMRequest):
                 print(f"[CALENDAR] Processing booking intent")
                 try:
                     # First, check if we have an email for this booking
-                    has_email = "email" in extracted_data and extracted_data["email"] and len(str(extracted_data["email"]).strip()) > 0
+                    has_email = "email" in extracted_data and extracted_data["email"]
                     
                     if not has_email:
                         # Add a system message to instruct KILA to ask for email or alternative contact
