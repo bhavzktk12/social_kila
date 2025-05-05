@@ -579,13 +579,14 @@ async def handle_dm(payload: DMRequest):
             # Tell KILA to mention the booking link will be below the message
             chat_messages.append({
                 "role": "system",
-                "content": "IMPORTANT: Let the user know they can click the booking link below your message. Don't include the actual URL in your message text, as it will be provided as a clickable button below."
+                "content": "IMPORTANT: When referring to booking options, tell the user to use 'the booking button below' or 'the button below this message'. NEVER say 'Insert Booking Link Here' or similar placeholder text. The system will automatically add a button with the correct link below your message."
             })
+            
             # Add critical limitation instructions to prevent false claims
             chat_messages.append({
-            "role": "system",
-            "content": "CRITICAL LIMITATION: You CANNOT directly book appointments or send emails. You can ONLY provide the booking link. Be very clear that the user needs to click the link below to book themselves. DO NOT claim that you've booked an appointment or sent a confirmation email. If asked if you've booked it, remind them they need to use the link below."
-        })
+                "role": "system",
+                "content": "CRITICAL LIMITATION: You CANNOT directly book appointments or send emails. You can ONLY direct users to use the booking button that will appear below your message. Be very clear that the user needs to click the button below to book themselves. DO NOT claim that you've booked an appointment or sent a confirmation email. If asked if you've booked it, remind them they need to use the button below."
+            })
             
         except Exception as e:
             print(f"[ERROR] Calendar processing error: {str(e)}")
