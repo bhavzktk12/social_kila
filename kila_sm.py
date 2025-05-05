@@ -5,7 +5,7 @@
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Union
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +33,9 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "agently-memory")
 # Message limits based on follower status
 MAX_MESSAGES_FOLLOWER = 150  # Store more messages for followers
 MAX_MESSAGES_NON_FOLLOWER = 50  # Store fewer messages for non-followers
+
+# Maximum response length (characters)
+MAX_RESPONSE_LENGTH = 950
 
 # Validate required environment variables
 if not OPENAI_API_KEY:
@@ -132,7 +135,6 @@ app.include_router(calendar_router)
 # Simple in-memory cache as backup for Pinecone
 # Maps username -> conversation history
 conversation_cache = {}
-
 # ========================
 # MEMORY FUNCTIONS
 # ========================
@@ -268,6 +270,48 @@ def should_suggest_follow(is_follower: str, text: str) -> bool:
     keywords = ["book", "price", "help", "demo", "automate", "setup"]
     return (is_follower == "0") and any(kw in text.lower() for kw in keywords)
 
+def truncate_response(text: str, max_length: int = MAX_RESPONSE_LENGTH) -> str:
+    """
+    Truncate a response to stay within the character limit.
+    
+    Args:
+        text: The text to truncate
+        max_length: Maximum allowed length in characters
+        
+    Returns:
+        Truncated text that ends at a sentence boundary if possible
+    """
+    if len(text) <= max_length:
+        return text
+    
+    # Try to truncate at a sentence boundary
+    truncated = text[:max_length]
+    
+    # Find the last sentence end
+    last_period_pos = truncated.rfind('.')
+    last_question_pos = truncated.rfind('?')
+    last_exclamation_pos = truncated.rfind('!')
+    
+    # Take the latest sentence end that's at least 70% of the allowed length
+    min_acceptable_pos = int(max_length * 0.7)
+    sentence_ends = [pos for pos in [last_period_pos, last_question_pos, last_exclamation_pos] 
+                    if pos > min_acceptable_pos]
+    
+    if sentence_ends:
+        # Truncate at the last sentence end
+        end_pos = max(sentence_ends) + 1
+        return text[:end_pos]
+    else:
+        # If no good sentence boundary, truncate at a word boundary
+        return truncated.rsplit(' ', 1)[0] + '...'
+
+def count_words(text: str) -> int:
+    """Count the number of words in a text."""
+    if not text:
+        return 0
+    # Split by whitespace and count non-empty items
+    return len([word for word in text.split() if word.strip()])
+
 # ========================
 # CALENDAR UTILS
 # ========================
@@ -300,7 +344,6 @@ def format_availability_slots(slots: List[dict], date: str) -> str:
         formatted += f"{i}. {start} - {end}\n"
     
     return formatted
-
 # ========================
 # API ENDPOINTS
 # ========================
@@ -405,6 +448,121 @@ async def test_calendar():
     
     return results
 
+@app.get("/debug-calendar")
+async def debug_calendar():
+    """Diagnostic endpoint for calendar integration."""
+    results = {}
+    
+    # 1. Check service account file
+    try:
+        service_account_path = "./kila-456404-d406b0474c4f.json"
+        alt_path = "./.kila-456404-d406b0474c4f.json"
+        
+        results["file_checks"] = {
+            "service_account_exists": os.path.exists(service_account_path),
+            "alt_path_exists": os.path.exists(alt_path),
+            "service_account_file_env": os.getenv("SERVICE_ACCOUNT_FILE"),
+            "current_directory": os.getcwd(),
+            "files_in_directory": os.listdir(".")[:10]  # List first 10 files
+        }
+    except Exception as e:
+        results["file_checks"] = {"error": str(e)}
+    
+    # 2. Check calendar API connection
+    try:
+        from cal_api import get_calendar_service
+        service = get_calendar_service()
+        
+        # Try to get calendar info
+        try:
+            calendar = service.calendars().get(calendarId="ceo@agently-ai.com").execute()
+            results["calendar_access"] = {
+                "success": True,
+                "name": calendar.get("summary", "Unknown"),
+                "timezone": calendar.get("timeZone", "Unknown")
+            }
+        except Exception as e:
+            results["calendar_access"] = {
+                "success": False,
+                "error": str(e)
+            }
+    except Exception as e:
+        results["service_initialization"] = {
+            "success": False,
+            "error": str(e)
+        }
+    
+    # 3. Test event creation
+    try:
+        from cal_api import create_event, EventRequest
+        
+        # Create event for tomorrow
+        now = datetime.now()
+        tomorrow = now + timedelta(days=1)
+        test_time = tomorrow.replace(hour=10, minute=0, second=0, microsecond=0)
+        
+        event_data = EventRequest(
+            summary="Debug Test Event",
+            start_time=test_time.isoformat(),
+            end_time=(test_time + timedelta(hours=1)).isoformat(),
+            description="Created by debug endpoint"
+        )
+        
+        # Try to create event
+        result = await create_event(event_data)
+        results["event_creation"] = {
+            "success": result.success if result else False,
+            "message": result.message if result else "No result returned",
+            "data": result.data if result and result.success else None
+        }
+    except Exception as e:
+        results["event_creation"] = {
+            "success": False,
+            "error": str(e)
+        }
+    
+    return results
+
+@app.get("/word-count")
+async def word_count(text: str):
+    """Count words in a text string."""
+    count = count_words(text)
+    return {
+        "text": text[:100] + "..." if len(text) > 100 else text,
+        "word_count": count,
+        "character_count": len(text)
+    }
+
+@app.get("/test-date-parsing")
+async def test_date_parsing(message: str):
+    """Test date parsing from a message."""
+    try:
+        from cal_help import extract_dates
+        import pytz
+        
+        # Extract dates
+        dates = extract_dates(message)
+        
+        # Format results
+        results = []
+        for date in dates:
+            results.append({
+                "iso_format": date.isoformat(),
+                "readable": date.strftime("%A, %B %d, %Y at %I:%M %p"),
+                "day_of_week": date.strftime("%A")
+            })
+        
+        return {
+            "original_message": message,
+            "extracted_dates": results
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 @app.post("/dm")
 async def handle_dm(payload: DMRequest):
     """
@@ -418,10 +576,14 @@ async def handle_dm(payload: DMRequest):
     # Use message_content if provided, otherwise use message
     message = payload.message_content if payload.message_content else payload.message
     print(f"[REQUEST] Message: '{message}'")
+    print(f"[REQUEST] Word count: {count_words(message)}, Character count: {len(message)}")
     
     # Check for calendar intent
     calendar_intent = detect_calendar_intent(message)
     calendar_data = None
+    # Initialize chat_messages here to avoid reference errors
+    chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
     if calendar_intent:
         print(f"[CALENDAR] Detected calendar intent: {calendar_intent}")
         instruction, extracted_data = process_calendar_intent(calendar_intent, message)
@@ -441,7 +603,7 @@ async def handle_dm(payload: DMRequest):
     
     # Fetch existing memory or create new one
     memory_str = fetch_memory(payload.username)
-    print(f"[MEMORY] Retrieved memory: {memory_str[:100]}...")
+    print(f"[MEMORY] Retrieved memory: {memory_str[:100] if memory_str else 'None'}...")
     
     # Check if this is a first-time user
     first_time = is_first_time_user(payload.username, memory_str)
@@ -476,6 +638,83 @@ async def handle_dm(payload: DMRequest):
                     except Exception as e:
                         print(f"[ERROR] Calendar availability error: {str(e)}")
             
+            # Handle booking appointments
+            elif calendar_intent == "book_appointment":
+                print(f"[CALENDAR] Processing booking intent")
+                try:
+                    # Check if we have date information
+                    if "dates" in extracted_data and extracted_data["dates"]:
+                        from cal_api import create_event, EventRequest
+                        from dateparser import parse
+                        
+                        # Parse the date
+                        date_str = extracted_data["dates"][0]
+                        print(f"[CALENDAR] Date from extracted data: {date_str}")
+                        
+                        # Parse start and end times
+                        start_time = parse(date_str, settings={'PREFER_DATES_FROM': 'future'})
+                        
+                        if not start_time:
+                            print(f"[CALENDAR] Failed to parse date: {date_str}")
+                        else:
+                            print(f"[CALENDAR] Parsed start time: {start_time.isoformat()}")
+                            
+                            # Set end time (1 hour later)
+                            end_time = start_time + timedelta(hours=1)
+                            
+                            # Create summary and description
+                            summary = f"Meeting with {payload.username}"
+                            if "purpose" in extracted_data:
+                                summary += f" - {extracted_data['purpose']}"
+                            
+                            description = f"Meeting requested by {payload.username} via Instagram DM"
+                            
+                            # Get attendee email from extracted data if available
+                            attendees = []
+                            if "email" in extracted_data and extracted_data["email"]:
+                                attendees.append(extracted_data["email"])
+                                print(f"[CALENDAR] Using attendee email from message: {extracted_data['email']}")
+                            
+                            # Create event request
+                            event_data = EventRequest(
+                                summary=summary,
+                                start_time=start_time.isoformat(),
+                                end_time=end_time.isoformat(),
+                                description=description,
+                                attendees=attendees  # Use extracted email or empty list
+                            )
+                            
+                            # Create the event
+                            print(f"[CALENDAR] Creating event with data: {event_data}")
+                            result = await create_event(event_data)
+                            
+                            # Check result
+                            if result.success:
+                                print(f"[CALENDAR] Successfully created event: {result.data}")
+                                event_id = result.data.get("event", {}).get("id")
+                                calendar_data = f"Appointment successfully booked for {start_time.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
+                                
+                                # Add note about attendee if no email was provided
+                                if not attendees:
+                                    calendar_data += " Please ask the user for their email to send a calendar invitation."
+                                    chat_messages.append({
+                                        "role": "system", 
+                                        "content": "IMPORTANT: The user didn't provide an email address. Please ask for their email so you can send them a calendar invitation with the meeting details."
+                                    })
+                            else:
+                                print(f"[CALENDAR] Failed to create event: {result.message}")
+                                calendar_data = f"Error creating event: {result.message}"
+                            
+                            # Add calendar data to AI context
+                            chat_messages.append({
+                                "role": "system",
+                                "content": f"CALENDAR ACTION RESULT: {calendar_data}"
+                            })
+                    else:
+                        print("[CALENDAR] No date information found in extracted data")
+                except Exception as e:
+                    print(f"[CALENDAR] Error in calendar event creation: {str(e)}")
+            
             elif calendar_intent == "list_appointments":
                 try:
                     # Call the calendar API directly
@@ -488,12 +727,69 @@ async def handle_dm(payload: DMRequest):
                         print(f"[CALENDAR] Retrieved events: {calendar_data}")
                 except Exception as e:
                     print(f"[ERROR] Calendar list events error: {str(e)}")
+            
+            # Handle rescheduling
+            elif "reschedule" in message.lower() or "change" in message.lower():
+                print(f"[CALENDAR] Processing reschedule request")
+                try:
+                    # Extract the new date
+                    from cal_help import extract_dates
+                    dates = extract_dates(message)
+                    
+                    if dates:
+                        from cal_api import create_event, EventRequest
+                        
+                        # Use the first date found
+                        new_date = dates[0]
+                        print(f"[CALENDAR] New date for rescheduling: {new_date.isoformat()}")
+                        
+                        # Set end time (1 hour later)
+                        end_time = new_date + timedelta(hours=1)
+                        
+                        # Get attendee email from extracted data if available
+                        attendees = []
+                        if "email" in extracted_data and extracted_data["email"]:
+                            attendees.append(extracted_data["email"])
+                        
+                        # Create event
+                        event_data = EventRequest(
+                            summary=f"Meeting with {payload.username} (Rescheduled)",
+                            start_time=new_date.isoformat(),
+                            end_time=end_time.isoformat(),
+                            description=f"Rescheduled meeting via Instagram DM",
+                            attendees=attendees
+                        )
+                        
+                        # Create the event
+                        print(f"[CALENDAR] Creating rescheduled event: {event_data}")
+                        result = await create_event(event_data)
+                        
+                        # Check result
+                        if result.success:
+                            print(f"[CALENDAR] Successfully created rescheduled event: {result.data}")
+                            event_id = result.data.get("event", {}).get("id")
+                            calendar_data = f"Appointment successfully rescheduled for {new_date.strftime('%A, %B %d at %I:%M %p')}. Event ID: {event_id}"
+                            
+                            # Add note about attendee if no email was provided
+                            if not attendees:
+                                calendar_data += " Please ask the user for their email to send a calendar invitation."
+                                chat_messages.append({
+                                    "role": "system", 
+                                    "content": "IMPORTANT: The user didn't provide an email address. Please ask for their email so you can send them a calendar invitation with the meeting details."
+                                })
+                        else:
+                            print(f"[CALENDAR] Failed to create rescheduled event: {result.message}")
+                            calendar_data = f"Error creating rescheduled event: {result.message}"
+                    else:
+                        print("[CALENDAR] Could not extract new date for rescheduling")
+                except Exception as e:
+                    print(f"[CALENDAR] Error in rescheduling: {str(e)}")
         
         except Exception as e:
             print(f"[ERROR] Calendar processing error: {str(e)}")
     
     # Build conversation context for the AI
-    chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # chat_messages was initialized at the start to avoid reference errors
     
     # Add memory context if available
     if current_memory:
@@ -535,6 +831,13 @@ async def handle_dm(payload: DMRequest):
         )
         reply = response.choices[0].message.content.strip()
         print(f"[OPENAI] Received response: '{reply[:50]}...'")
+        print(f"[OPENAI] Response word count: {count_words(reply)}, Character count: {len(reply)}")
+        
+        # Check if the response is too long and truncate if needed
+        if len(reply) > MAX_RESPONSE_LENGTH:
+            original_length = len(reply)
+            reply = truncate_response(reply, MAX_RESPONSE_LENGTH)
+            print(f"[OPENAI] Truncated response from {original_length} to {len(reply)} characters")
     except Exception as e:
         print(f"[ERROR] OpenAI error: {str(e)}")
         reply = "Sorry, I'm having trouble connecting right now. Could you try again in a moment?"
