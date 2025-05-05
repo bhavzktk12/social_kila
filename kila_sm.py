@@ -581,6 +581,11 @@ async def handle_dm(payload: DMRequest):
                 "role": "system",
                 "content": "IMPORTANT: Let the user know they can click the booking link below your message. Don't include the actual URL in your message text, as it will be provided as a clickable button below."
             })
+            # Add critical limitation instructions to prevent false claims
+            chat_messages.append({
+            "role": "system",
+            "content": "CRITICAL LIMITATION: You CANNOT directly book appointments or send emails. You can ONLY provide the booking link. Be very clear that the user needs to click the link below to book themselves. DO NOT claim that you've booked an appointment or sent a confirmation email. If asked if you've booked it, remind them they need to use the link below."
+        })
             
         except Exception as e:
             print(f"[ERROR] Calendar processing error: {str(e)}")
